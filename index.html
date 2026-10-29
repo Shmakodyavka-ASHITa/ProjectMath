@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>МатТренажёр — тригонометрия, прямые, фигуры</title>
 <style>
-:root{--bg:#f4f1ff;--card:rgba(255,255,255,.82);--text:#1b1740;--muted:#6b6894;--a:#6c4cf5;--b:#00b7d4;--ok:#16a34a;--bad:#e11d48;--line:rgba(108,76,245,.18);color-scheme:light}
+:root{--bg:#f4f1ff;--card:rgba(255,255,255,.82);--text:#1b1740;--muted:#6b6894;--a:#6c4cf5;--b:#00b7d4;--ok:#16a34a;--bad:#e11d48;--line:rgba(108,76,245,.18);box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);color-scheme:light}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0e0b24;--card:rgba(32,27,70,.78);--text:#f1eeff;--muted:#a49fd6;--a:#8b73ff;--b:#22d3ee;--line:rgba(139,115,255,.28);color-scheme:dark}}
 :root[data-theme="dark"]{--bg:#0e0b24;--card:rgba(32,27,70,.78);--text:#f1eeff;--muted:#a49fd6;--a:#8b73ff;--b:#22d3ee;--line:rgba(139,115,255,.28);color-scheme:dark}
 *{box-sizing:border-box}
@@ -54,986 +54,164 @@ table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:4px 6px;b
 <div id="app"></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script>
-/* ============================================================
-   1. CONSTANTS
-   ============================================================ */
-const SHARE_URL   = 'https://claude.ai/artifact/GN2AffXrf3HuQcnZR2nAr5';
-const PI          = 3.14;
-const SESSION_KEY = 'mt_session';
-const SCORES_KEY  = 'mt_scores';
-const ROUND_SIZE  = 10;
-const TIME_PER_Q  = 25;
-
-/* ============================================================
-   2. UTILITIES
-   ============================================================ */
-const $   = (sel) => document.querySelector(sel);
-const esc = (s) => String(s).replace(/[&<>"']/g, c =>
-  ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
-
-const rand    = (a, b) => Math.floor(Math.random() * (b - a + 1)) + a;
-const pick    = (arr)  => arr[rand(0, arr.length - 1)];
-const shuffle = (arr)  => arr
-  .map(x => [Math.random(), x])
-  .sort((p, q) => p[0] - q[0])
-  .map(x => x[1]);
-
-const fmtNum = (n) =>
-  String(+Number(n).toFixed(2)).replace('.', ',').replace('-', '−');
-
-const gcd = (a, b) => b ? gcd(b, a % b) : a;
-const frac = (n, d) => {
-  const g = gcd(Math.abs(n), Math.abs(d)) || 1;
-  n /= g; d /= g;
-  if (d < 0) { n = -n; d = -d; }
-  return (d === 1 ? String(n) : `${n}/${d}`).replace('-', '−');
-};
-
-const LS = {
-  get(key, fallback) {
-    try {
-      const v = JSON.parse(localStorage.getItem(key));
-      return v == null ? fallback : v;
-    } catch (e) { return fallback; }
-  },
-  set(key, value) {
-    try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) {}
-  }
-};
-
-/* ============================================================
-   3. STORAGE (local + optional shared)
-   ============================================================ */
-let db     = null;
-let mode   = 'local';   // 'local' | 'shared'
-let me     = null;
-let board  = [];
-let unsub  = null;
-
-async function sha(text) {
-  try {
-    const buf = await crypto.subtle.digest(
-      'SHA-256', new TextEncoder().encode('mt|' + text)
-    );
-    return [...new Uint8Array(buf)]
-      .map(x => x.toString(16).padStart(2, '0')).join('');
-  } catch (e) {
-    return btoa(unescape(encodeURIComponent('mt|' + text)));
-  }
-}
-
-async function getUser(id) {
-  if (db) {
-    try {
-      const snap = await db.collection('scores').doc(id).get();
-      if (snap.exists) return snap.data();
-    } catch (e) {
-      db = null; mode = 'local';
-    }
-  }
-  return LS.get(SCORES_KEY, {})[id] || null;
-}
-
-async function putUser(user) {
-  const all = LS.get(SCORES_KEY, {});
-  all[user.id] = user;
-  LS.set(SCORES_KEY, all);
-  if (db) {
-    try {
-      await db.collection('scores').doc(user.id).set(user);
-    } catch (e) {
-      db = null; mode = 'local';
-    }
-  }
-}
-
-function startBoard() {
-  if (unsub) unsub();
-  const localUsers = () => Object.values(LS.get(SCORES_KEY, {}));
-  if (db) {
-    try {
-      unsub = db.collection('scores').onSnapshot(
-        snap => { board = snap.docs.map(d => d.data()); refresh(); },
-        ()   => { board = localUsers(); refresh(); }
-      );
-      return;
-    } catch (e) { /* fall through */ }
-  }
-  board = localUsers();
-  refresh();
-}
-
-function refresh() {
-  if (screen === 'home' || screen === 'board') go(screen);
-}
-
-/* ============================================================
-   4. QUESTION SYSTEM
-   ============================================================ */
-
-/**
- * Creates a multiple-choice question.
- * @param {string}             text        – условие
- * @param {string|number}      answer      – правильный ответ
- * @param {Array<string|number>} distractors – неверные варианты
- * @param {string}             explanation – пояснение после ответа
- */
-function makeQuestion(text, answer, distractors, explanation) {
-  const numeric   = typeof answer === 'number';
-  const format    = numeric ? fmtNum : String;
-  const answerStr = format(answer);
-  const seen      = new Set([answerStr]);
-  const opts      = [];
-
-  for (const d of distractors || []) {
-    const v = format(d);
-    if (!seen.has(v)) { seen.add(v); opts.push(v); }
-  }
-
-  // Добиваем числовые дистракторы близкими значениями
-  for (let i = 0; numeric && opts.length < 3 && i < 80; i++) {
-    const step = Math.max(1, Math.round(Math.abs(answer) / 10));
-    const x = answer + pick([-1, 1]) * rand(1, 5) * step;
-    if (answer > 0 && x <= 0) continue;
-    const v = format(x);
-    if (!seen.has(v)) { seen.add(v); opts.push(v); }
-  }
-
-  return {
-    text,
-    answer: answerStr,
-    options: shuffle([answerStr, ...opts.slice(0, 3)]),
-    explanation
-  };
-}
-
-/* ---------- 4.1 Тригонометрия ---------- */
-const TRIG_TABLE = {
-  sin: { 30: '1/2',   45: '√2/2', 60: '√3/2' },
-  cos: { 30: '√3/2',  45: '√2/2', 60: '1/2'  },
-  tg:  { 30: '√3/3',  45: '1',    60: '√3'   }
-};
-const TRIG_VALUES   = ['1/2', '√2/2', '√3/2', '√3/3', '1', '√3'];
-const PYTHAGOREAN   = [[3,4,5], [5,12,13], [8,15,17]];
-
-function trigTable() {
-  const angle  = pick([30, 45, 60]);
-  const fn     = pick(['sin', 'cos', 'tg']);
-  const answer = TRIG_TABLE[fn][angle];
-  return makeQuestion(
-    `Чему равен ${fn} ${angle}°?`,
-    answer,
-    shuffle(TRIG_VALUES.filter(v => v !== answer)).slice(0, 3),
-    `Табличное значение: ${fn} ${angle}° = ${answer}.`
-  );
-}
-
-function trigRightTriangle(level) {
-  const [a, b, c] = pick(PYTHAGOREAN);
-  const k  = level > 1 ? rand(2, 4) : 1;
-  const fn = pick(['sin', 'cos', 'tg']);
-  const answer = { sin: frac(a, c), cos: frac(b, c), tg: frac(a, b) }[fn];
-  return makeQuestion(
-    `В прямоугольном треугольнике катеты ${a*k} и ${b*k}. ` +
-    `Найди ${fn} угла α, лежащего напротив катета ${a*k}.`,
-    answer,
-    [frac(b,c), frac(a,b), frac(b,a), frac(c,a)]
-      .filter(x => x !== answer).slice(0, 3),
-    `Гипотенуза = ${c*k}. sin = противолежащий/гипотенуза, ` +
-    `cos = прилежащий/гипотенуза, tg = противолежащий/прилежащий. Ответ: ${answer}.`
-  );
-}
-
-function trigRadians() {
-  const pairs = [
-    ['π/6', 30], ['π/4', 45], ['π/3', 60], ['π/2', 90],
-    ['2π/3', 120], ['3π/4', 135], ['5π/6', 150], ['π', 180]
-  ];
-  const [rad, deg] = pick(pairs);
-  const extra = deg === 90 ? 45 : 180 - deg;
-  return makeQuestion(
-    `Переведи ${rad} радиан в градусы.`,
-    deg,
-    [deg * 2, deg + 30, extra],
-    `π рад = 180°, поэтому ${rad} = ${deg}°.`
-  );
-}
-
-function trigFromCos() {
-  const [a, b, c] = pick(PYTHAGOREAN);
-  const answer = frac(a, c);
-  return makeQuestion(
-    `cos α = ${frac(b, c)}, угол α острый. Найди sin α.`,
-    answer,
-    [frac(b,c), frac(a,b), frac(c,a)],
-    `sin²α + cos²α = 1 → sin α = √(1 − (${b}/${c})²) = ${answer}.`
-  );
-}
-
-/* ---------- 4.2 Прямые ---------- */
-function lineEq(k, b) {
-  const kPart = k === 1 ? '' : k === -1 ? '−' : k;
-  const bPart = b === 0 ? '' : b > 0 ? ` + ${b}` : ` − ${Math.abs(b)}`;
-  return `y = ${kPart}x${bPart}`;
-}
-
-function linesParallelAngles() {
-  const x = rand(40, 80);
-  const [type, answer] = pick([
-    ['соответственный', x],
-    ['накрест лежащий', x],
-    ['односторонний',   180 - x]
-  ]);
-  const distractors = [180 - x, x + 10, 180 - x + 10].filter(v => v !== answer);
-  return makeQuestion(
-    `Две параллельные прямые пересечены секущей. ` +
-    `Один из углов равен ${x}°. Чему равен ${type} ему угол?`,
-    answer,
-    distractors,
-    `Соответственные и накрест лежащие углы равны, ` +
-    `односторонние дают в сумме 180°. Ответ: ${answer}°.`
-  );
-}
-
-function linesSlope() {
-  const k  = pick([-3, -2, -1, 1, 2, 3, 4]);
-  const x1 = rand(-3, 2);
-  const x2 = x1 + rand(1, 4);
-  const y1 = rand(-4, 4);
-  const y2 = y1 + k * (x2 - x1);
-  return makeQuestion(
-    `Найди угловой коэффициент прямой, проходящей через ` +
-    `A(${fmtNum(x1)}; ${fmtNum(y1)}) и B(${fmtNum(x2)}; ${fmtNum(y2)}).`,
-    k,
-    [-k, k + 1, k - 1, k * 2],
-    `k = (y₂ − y₁)/(x₂ − x₁) = (${y2 - y1})/(${x2 - x1}) = ${k}.`
-  );
-}
-
-function linesParallelPerp() {
-  if (Math.random() < 0.5) {
-    const k = pick([2, 3, 4, 5, -2, -3]);
-    const b = rand(-5, 5);
-    const answer = frac(-1, k);
-    return makeQuestion(
-      `Прямая ${lineEq(k, b)} перпендикулярна прямой y = mx + 1. Найди m.`,
-      answer,
-      [frac(1, k), String(-k), String(k)],
-      `Для перпендикулярных прямых k₁·k₂ = −1, ` +
-      `значит m = −1/${k} = ${answer}.`
-    );
-  }
-  const k = rand(-5, 5) || 2;
-  return makeQuestion(
-    `Прямые y = ${fmtNum(k)}x + 3 и y = mx − 5 параллельны. Найди m.`,
-    k,
-    [-k, k + 1, k - 1],
-    `Параллельные прямые имеют равные угловые коэффициенты: ` +
-    `m = ${fmtNum(k)}.`
-  );
-}
-
-function linesIntersection() {
-  const x = rand(-4, 4);
-  const y = rand(-6, 6);
-  let k1 = rand(-3, 3) || 1;
-  let k2 = rand(-3, 3) || -2;
-  if (k1 === k2) k2 = k1 + 1;
-  const b1 = y - k1 * x;
-  const b2 = y - k2 * x;
-  const pt = (a, b) => `(${fmtNum(a)}; ${fmtNum(b)})`;
-  const answer = pt(x, y);
-  return makeQuestion(
-    `Найди точку пересечения прямых ${lineEq(k1, b1)} и ${lineEq(k2, b2)}.`,
-    answer,
-    [pt(y, x), pt(-x, y), pt(x, -y), pt(x + 1, y - 1)]
-      .filter(v => v !== answer).slice(0, 3),
-    `Приравняй правые части: ${k1}x + ${b1} = ${k2}x + ${b2} ` +
-    `→ x = ${x}, тогда y = ${y}.`
-  );
-}
-
-function linesTriangleAngles() {
-  const a = rand(30, 80);
-  const b = rand(30, 80);
-  const answer = 180 - a - b;
-  return makeQuestion(
-    `В треугольнике два угла равны ${a}° и ${b}°. Найди третий угол.`,
-    answer,
-    [360 - a - b, 90 - a, 180 - a],
-    `Сумма углов треугольника 180°: 180 − ${a} − ${b} = ${answer}°.`
-  );
-}
-
-/* ---------- 4.3 Геометрия ---------- */
-function geoArea(level) {
-  const cap  = 4 + level * 4;
-  const type = pick(['rect', 'tri', 'trap', 'par', 'rho', 'cir']);
-
-  if (type === 'rect') {
-    const a = rand(3, cap), b = rand(2, cap);
-    return makeQuestion(
-      `Площадь прямоугольника со сторонами ${a} и ${b}?`,
-      a * b, [2 * (a + b), a + b, a * b / 2],
-      `S = a·b = ${a}·${b} = ${a * b}.`
-    );
-  }
-  if (type === 'tri') {
-    const a = 2 * rand(2, cap), h = rand(3, cap);
-    return makeQuestion(
-      `Площадь треугольника с основанием ${a} и высотой ${h}?`,
-      a * h / 2, [a * h, a + h, a * h / 3],
-      `S = ½·a·h = ½·${a}·${h} = ${a * h / 2}.`
-    );
-  }
-  if (type === 'trap') {
-    const a = rand(3, cap);
-    const b = a + 2 * rand(1, 3);
-    const h = rand(2, cap);
-    return makeQuestion(
-      `Основания трапеции ${a} и ${b}, высота ${h}. Найди площадь.`,
-      (a + b) * h / 2,
-      [(a + b) * h, a * b * h / 2, (a + b) / 2],
-      `S = ½(a + b)·h = ½·${a + b}·${h} = ${(a + b) * h / 2}.`
-    );
-  }
-  if (type === 'par') {
-    const a = rand(3, cap), h = rand(2, cap);
-    return makeQuestion(
-      `Сторона параллелограмма ${a}, высота к ней ${h}. Найди площадь.`,
-      a * h, [a * h / 2, 2 * (a + h), a + h],
-      `S = a·h = ${a * h}.`
-    );
-  }
-  if (type === 'rho') {
-    const d = 2 * rand(2, cap), e = rand(3, cap);
-    return makeQuestion(
-      `Диагонали ромба ${d} и ${e}. Найди площадь.`,
-      d * e / 2, [d * e, d + e, d * e / 4],
-      `S = ½·d₁·d₂ = ½·${d}·${e} = ${d * e / 2}.`
-    );
-  }
-  // круг: r >= 3, чтобы не пересекались πr² и 2πr (r=2)
-  const r    = rand(3, level * 3 + 2);
-  const area = PI * r * r;
-  return makeQuestion(
-    `Площадь круга радиуса ${r} (π ≈ 3,14)?`,
-    area,
-    [2 * PI * r, PI * r, PI * r * r * 2],
-    `S = πr² = 3,14·${r}² = ${fmtNum(area)}.`
-  );
-}
-
-function geoVolume(level) {
-  const cap  = 2 + level * 2;
-  const type = pick(['cube', 'box', 'cyl', 'cone', 'pyr', 'sph', 'pri']);
-
-  if (type === 'cube') {
-    const a = rand(2, cap + 1);
-    return makeQuestion(
-      `Объём куба с ребром ${a}?`,
-      a ** 3, [a * a * 6, a * a, 3 * a],
-      `V = a³ = ${a}³ = ${a ** 3}.`
-    );
-  }
-  if (type === 'box') {
-    const a = rand(2, cap + 2), b = rand(2, cap + 2), c = rand(2, cap + 2);
-    return makeQuestion(
-      `Объём параллелепипеда ${a}×${b}×${c}?`,
-      a * b * c,
-      [2 * (a * b + b * c + a * c), a * b * c / 2, a + b + c],
-      `V = a·b·c = ${a * b * c}.`
-    );
-  }
-  if (type === 'cyl') {
-    const r = rand(2, cap), h = rand(2, cap + 3);
-    return makeQuestion(
-      `Объём цилиндра: r = ${r}, h = ${h} (π ≈ 3,14).`,
-      PI * r * r * h,
-      [PI * r * r * h / 3, 2 * PI * r * h, PI * r * r],
-      `V = πr²h = 3,14·${r}²·${h} = ${fmtNum(PI * r * r * h)}.`
-    );
-  }
-  if (type === 'cone') {
-    const r = rand(2, cap), h = 3 * rand(1, cap);
-    return makeQuestion(
-      `Объём конуса: r = ${r}, h = ${h} (π ≈ 3,14).`,
-      PI * r * r * h / 3,
-      [PI * r * r * h, PI * r * h / 3, PI * r * r * h * 2 / 3],
-      `V = ⅓πr²h = ⅓·3,14·${r}²·${h} = ${fmtNum(PI * r * r * h / 3)}.`
-    );
-  }
-  if (type === 'pyr') {
-    const s = rand(4, cap * 4), h = 3 * rand(1, cap);
-    return makeQuestion(
-      `Площадь основания пирамиды ${s}, высота ${h}. Найди объём.`,
-      s * h / 3, [s * h, s * h / 2, s + h],
-      `V = ⅓·S·h = ⅓·${s}·${h} = ${s * h / 3}.`
-    );
-  }
-  if (type === 'sph') {
-    // r = 5 или 6 — избегаем совпадения 4πr² и πr³ (r=4) и 4πr² и V (r=3)
-    const r = pick([5, 6]);
-    const v = 4 / 3 * PI * r ** 3;
-    return makeQuestion(
-      `Объём шара радиуса ${r} (π ≈ 3,14)?`,
-      v,
-      [PI * r ** 3, 4 * PI * r * r, 4 / 3 * PI * r * r],
-      `V = 4/3·πr³ = 4/3·3,14·${r}³ = ${fmtNum(v)}.`
-    );
-  }
-  // призма
-  const s = rand(3, cap * 3), h = rand(2, cap + 2);
-  return makeQuestion(
-    `Площадь основания призмы ${s}, высота ${h}. Найди объём.`,
-    s * h, [s * h / 3, s + h, s * h / 2],
-    `V = S·h = ${s * h}.`
-  );
-}
-
-function geoSurface(level) {
-  const cap  = 3 + level * 2;
-  const type = pick(['cube', 'box', 'cyl']);
-
-  if (type === 'cube') {
-    const a = rand(2, cap + 2);
-    return makeQuestion(
-      `Площадь поверхности куба с ребром ${a}?`,
-      6 * a * a, [4 * a * a, a ** 3, 12 * a],
-      `S = 6a² = 6·${a}² = ${6 * a * a}.`
-    );
-  }
-  if (type === 'box') {
-    const a = rand(2, cap), b = rand(2, cap), c = rand(2, cap);
-    const s = 2 * (a * b + b * c + a * c);
-    return makeQuestion(
-      `Площадь поверхности параллелепипеда ${a}×${b}×${c}?`,
-      s,
-      [a * b * c, s / 2, a * b + b * c + a * c + a],
-      `S = 2(ab + bc + ac) = ${s}.`
-    );
-  }
-  // цилиндр (боковая поверхность)
-  const r = rand(2, cap), h = rand(2, cap + 2);
-  const s = 2 * PI * r * h;
-  return makeQuestion(
-    `Площадь боковой поверхности цилиндра: r = ${r}, h = ${h} (π ≈ 3,14).`,
-    s,
-    [PI * r * h, 2 * PI * r * (r + h), PI * r * r * h],
-    `Sбок = 2πrh = 2·3,14·${r}·${h} = ${fmtNum(s)}.`
-  );
-}
-
-/* ---------- 4.4 Реестр тем ---------- */
-const TOPICS = {
-  trig: {
-    name: 'Тригонометрия',
-    icon: '📐',
-    desc: 'sin, cos, tg, радианы',
-    generators: [
-      { minLevel: 1, fn: trigTable },
-      { minLevel: 1, fn: trigRightTriangle },
-      { minLevel: 1, fn: trigRadians },
-      { minLevel: 2, fn: trigFromCos }
-    ]
-  },
-  lines: {
-    name: 'Свойства прямых',
-    icon: '📏',
-    desc: 'углы, k, пересечения',
-    generators: [
-      { minLevel: 1, fn: linesParallelAngles },
-      { minLevel: 1, fn: linesSlope },
-      { minLevel: 2, fn: linesParallelPerp },
-      { minLevel: 2, fn: linesTriangleAngles },
-      { minLevel: 3, fn: linesIntersection }
-    ]
-  },
-  geo: {
-    name: 'Объёмы и площади',
-    icon: '🧊',
-    desc: 'фигуры и тела',
-    generators: [
-      { minLevel: 1, fn: geoArea },
-      { minLevel: 1, fn: geoVolume },
-      { minLevel: 2, fn: geoSurface }
-    ]
-  }
-};
-
-function generateQuestion(topicKey, level) {
-  const actualTopic = topicKey === 'mix'
-    ? pick(Object.keys(TOPICS))
-    : topicKey;
-  const all       = TOPICS[actualTopic].generators;
-  const available = all.filter(g => g.minLevel <= level);
-  const pool      = available.length ? available : all;
-  const gen       = pick(pool).fn;
-  return { ...gen(level), topic: actualTopic };
-}
-
-/* ============================================================
-   5. GAME STATE
-   ============================================================ */
-let screen   = 'auth';
-let G        = null;
-let selLevel = 1;
-
-/* ============================================================
-   6. SCREENS
-   ============================================================ */
-const app = $('#app');
-
-function go(s) {
-  screen = s;
-  const screens = {
-    auth: authScreen, home: homeScreen, play: playScreen,
-    result: resultScreen, board: boardScreen,
-    about: aboutScreen, sheet: sheetScreen
-  };
-  (screens[s] || homeScreen)();
-}
-
-function themeBtn() {
-  return `<button onclick="toggleTheme()" aria-label="Тема">🌓</button>`;
-}
-function toggleTheme() {
-  const d    = document.documentElement;
-  const dark = getComputedStyle(d).colorScheme === 'dark';
-  d.dataset.theme = dark ? 'light' : 'dark';
-}
-function modeTag() {
-  return `<span class="badge">${mode === 'shared' ? '🌐 общий рейтинг' : '📱 локальный рейтинг'}</span>`;
-}
-
-/* ---------- 6.1 Авторизация ---------- */
-function authScreen() {
-  app.innerHTML = `
-    <div class="card">
-      <div class="big">🧮</div>
-      <h1 class="grad" style="text-align:center">МатТренажёр</h1>
-      <p class="muted" style="text-align:center">Тригонометрия · Прямые · Площади и объёмы</p>
-      <input id="nm" placeholder="Ник или имя" maxlength="20" autocomplete="username">
-      <input id="gr" placeholder="Группа (необязательно)" maxlength="12">
-      <input id="pw" type="password" placeholder="Пароль" autocomplete="current-password">
-      <p class="muted" id="msg">Нет аккаунта? Просто введи ник и придумай пароль — мы зарегистрируем тебя автоматически.</p>
-      <button class="pri" onclick="doAuth()">Войти / Зарегистрироваться</button>
-    </div>
-    <p class="muted" style="text-align:center">${modeTag()}</p>`;
-}
-
-async function doAuth() {
-  const name  = $('#nm').value.trim();
-  const group = $('#gr').value.trim();
-  const pw    = $('#pw').value;
-  const msg   = $('#msg');
-
-  if (name.length < 2 || pw.length < 3) {
-    msg.textContent = 'Ник от 2 символов, пароль от 3.';
-    return;
-  }
-
-  msg.textContent = 'Проверяем…';
-  const id     = 'u' + (await sha(name.toLowerCase())).slice(0, 20);
-  const pwHash = await sha(pw + id);
-  let user     = await getUser(id);
-
-  if (user) {
-    if (user.ph !== pwHash) {
-      msg.textContent = '❌ Неверный пароль для этого ника.';
-      return;
-    }
-    if (group && group !== user.g) {
-      user.g = group;
-      await putUser(user);
-    }
-  } else {
-    user = {
-      id, name, g: group, ph: pwHash,
-      xp: 0, best: 0, games: 0, solved: 0, ok: 0, streak: 0, badges: []
-    };
-    await putUser(user);
-  }
-
-  me = user;
-  LS.set(SESSION_KEY, id);
-  startBoard();
-  go('home');
-}
-
-function logout() {
-  LS.set(SESSION_KEY, null);
-  me = null;
-  if (unsub) unsub();
-  go('auth');
-}
-
-function rank() {
-  const others = board.filter(x => x.id !== me.id);
-  const sorted = [...others, me].sort((a, b) => b.xp - a.xp);
-  return sorted.findIndex(x => x.id === me.id) + 1;
-}
-
-function levelName(xp) {
-  if (xp < 100)  return 'Новичок';
-  if (xp < 400)  return 'Ученик';
-  if (xp < 1000) return 'Знаток';
-  if (xp < 2000) return 'Мастер';
-  return 'Гуру математики';
-}
-
-/* ---------- 6.2 Главный экран ---------- */
-function homeScreen() {
-  const accuracy = me.solved ? Math.round(me.ok / me.solved * 100) : 0;
-  const topicsList = Object.entries(TOPICS).map(([key, t]) => `
-    <button class="topic" onclick="start('${key}')">
-      <span class="ic">${t.icon}</span>
-      <span><b>${t.name}</b><small>${t.desc}</small></span>
-    </button>`).join('');
-
-  app.innerHTML = `
-    <div class="top">
-      <div>
-        <div class="muted">Привет,</div>
-        <h2 style="margin:0">${esc(me.name)} 👋</h2>
-      </div>
-      <div class="row" style="flex:none">
-        <button onclick="showQR()">📱 QR</button>${themeBtn()}
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="stats">
-        <div><b>${me.xp}</b><small>XP</small></div>
-        <div><b>#${rank()}</b><small>место</small></div>
-        <div><b>${me.games}</b><small>игр</small></div>
-        <div><b>${accuracy}%</b><small>точность</small></div>
-      </div>
-      <p class="muted" style="margin:12px 0 0">
-        Ранг: <b>${levelName(me.xp)}</b> ${modeTag()}
-      </p>
-      ${(me.badges || []).map(b => `<span class="badge">${esc(b)}</span>`).join('')}
-    </div>
-
-    <div class="card">
-      <h2>Выбери тему</h2>
-      <div class="row" style="margin-bottom:10px">
-        ${[1, 2, 3].map(l => `
-          <button class="chip ${selLevel === l ? 'on' : ''}"
-                  onclick="selLevel=${l};homeScreen()">
-            ${['🟢 Лёгкий', '🟡 Средний', '🔴 Сложный'][l - 1]}
-          </button>`).join('')}
-      </div>
-      ${topicsList}
-      <button class="topic" onclick="start('mix')">
-        <span class="ic">🎲</span>
-        <span><b>Микс-челлендж</b><small>все темы вперемешку</small></span>
-      </button>
-    </div>
-
-    <div class="row">
-      <button onclick="go('board')">🏆 Лидеры</button>
-      <button onclick="go('sheet')">📖 Шпаргалка</button>
-      <button onclick="go('about')">ℹ️ О проекте</button>
-      <button onclick="logout()">🚪 Выйти</button>
-    </div>`;
-}
-
-/* ---------- 6.3 Раунд ---------- */
-function start(topicKey) {
-  G = {
-    topic: topicKey, level: selLevel,
-    i: 0, xp: 0, streak: 0, maxStreak: 0, ok: 0,
-    hint: false, done: false, timer: null, left: TIME_PER_Q
-  };
-  nextQuestion();
-}
-
-function tickTimer() {
-  G.left -= 0.1;
-  const bar = $('#tb');
-  if (bar) bar.style.width = Math.max(0, G.left / TIME_PER_Q * 100) + '%';
-  if (G.left <= 0) answer(-1);
-}
-
-function nextQuestion() {
-  if (G.i >= ROUND_SIZE) { finishGame(); return; }
-  clearInterval(G.timer);
-  G.q    = generateQuestion(G.topic, G.level);
-  G.i++;
-  G.done = false;
-  G.hint = false;
-  G.left = TIME_PER_Q;
-  go('play');
-  G.timer = setInterval(tickTimer, 100);
-}
-
-function playScreen() {
-  const q = G.q;
-  app.innerHTML = `
-    <div class="top">
-      <button onclick="quitGame()">✕</button>
-      <b>Вопрос ${G.i}/${ROUND_SIZE}</b>
-      <span class="badge">⭐ ${G.xp} · 🔥 ${G.streak}</span>
-    </div>
-    <div class="card">
-      <div class="bar"><i id="tb" style="width:${G.left / TIME_PER_Q * 100}%"></i></div>
-      <div class="muted">${TOPICS[q.topic].icon} ${TOPICS[q.topic].name}</div>
-      <p class="q">${esc(q.text)}</p>
-      <div class="opts">
-        ${q.options.map((o, i) => `
-          <button id="o${i}" onclick="answer(${i})">${esc(o)}</button>`).join('')}
-      </div>
-      <div id="fb">
-        <button id="hb" style="margin-top:12px;width:100%" onclick="useHint()">
-          💡 Подсказка 50/50 (−5 XP)
-        </button>
-      </div>
-    </div>`;
-}
-
-function useHint() {
-  if (G.done || G.hint) return;
-  G.hint = true;
-  const wrongIdx = G.q.options
-    .map((o, i) => i)
-    .filter(i => G.q.options[i] !== G.q.answer);
-  shuffle(wrongIdx).slice(0, 2).forEach(i => {
-    const b = $('#o' + i);
-    b.disabled = true;
-    b.classList.add('off');
-  });
-  $('#hb').disabled = true;
-}
-
-function answer(selected) {
-  if (G.done) return;
-  G.done = true;
-  clearInterval(G.timer);
-
-  const q       = G.q;
-  const correct = selected >= 0 && q.options[selected] === q.answer;
-
-  if (correct) {
-    G.ok++;
-    G.streak++;
-    G.maxStreak = Math.max(G.maxStreak, G.streak);
-    const speedBonus  = Math.floor(Math.max(G.left, 0) / 5);
-    const streakBonus = Math.min(G.streak, 5) * 2;
-    const base        = 10 * G.level;
-    const hintPenalty = G.hint ? 5 : 0;
-    G.xp += Math.max(base + speedBonus + streakBonus - hintPenalty, 3);
-  } else {
-    G.streak = 0;
-  }
-
-  q.options.forEach((o, k) => {
-    const b = $('#o' + k);
-    b.disabled = true;
-    if (o === q.answer)       b.classList.add('ok');
-    else if (k === selected)  b.classList.add('bad');
-    else                      b.classList.add('off');
-  });
-
-  const status    = correct ? '✅ Верно!' : selected < 0 ? '⏰ Время вышло.' : '❌ Не совсем.';
-  const nextLabel = G.i >= ROUND_SIZE ? 'Результаты' : 'Дальше →';
-  $('#fb').innerHTML = `
-    <div class="ex">${status} ${esc(q.explanation)}</div>
-    <button class="pri" style="margin-top:12px" onclick="nextQuestion()">${nextLabel}</button>`;
-}
-
-function quitGame() {
-  clearInterval(G.timer);
-  go('home');
-}
-
-async function finishGame() {
-  clearInterval(G.timer);
-  const u = me;
-  u.badges = u.badges || [];
-
-  u.xp     += G.xp;
-  u.best    = Math.max(u.best || 0, G.xp);
-  u.games++;
-  u.solved += ROUND_SIZE;
-  u.ok     += G.ok;
-  u.t       = Date.now();
-
-  const newBadges = [];
-  const tryAdd = (cond, title) => {
-    if (cond && !u.badges.includes(title)) {
-      u.badges.push(title);
-      newBadges.push(title);
-    }
-  };
-  tryAdd(true,                    '🎓 Первая игра');
-  tryAdd(G.ok === ROUND_SIZE,     '💯 Идеальный раунд');
-  tryAdd(G.maxStreak >= 5,        '🔥 Серия ×5');
-  tryAdd(u.xp >= 500,             '🚀 500 XP');
-  tryAdd(u.games >= 10,           '🏅 10 игр');
-  tryAdd(G.level === 3 && G.ok >= 8, '🧠 Хардкор');
-
-  G.newBadges = newBadges;
-  await putUser(u);
-  go('result');
-}
-
-/* ---------- 6.4 Результат ---------- */
-function resultScreen() {
-  const stars = G.ok >= 9 ? 3 : G.ok >= 7 ? 2 : G.ok >= 5 ? 1 : 0;
-  const starStr = '⭐'.repeat(stars) || '💪';
-  app.innerHTML = `
-    <div class="card">
-      <div class="big">${starStr}</div>
-      <h1 style="text-align:center" class="grad">${G.ok} из ${ROUND_SIZE}</h1>
-      <p style="text-align:center" class="muted">+${G.xp} XP · лучшая серия 🔥 ${G.maxStreak}</p>
-      <p style="text-align:center">Всего ${me.xp} XP · место <b>#${rank()}</b></p>
-      ${G.newBadges.length
-        ? `<p style="text-align:center">Новые награды:<br>${G.newBadges.map(b => `<span class="badge">${b}</span>`).join('')}</p>`
-        : ''}
-      <button class="pri" onclick="start('${G.topic}')">Ещё раз</button>
-      <div class="row" style="margin-top:10px">
-        <button onclick="go('board')">🏆 Лидеры</button>
-        <button onclick="go('home')">🏠 Меню</button>
-      </div>
-    </div>`;
-}
-
-/* ---------- 6.5 Лидеры ---------- */
-function boardScreen() {
-  const others = board.filter(x => x.id !== me.id);
-  const list   = [...others, me].sort((a, b) => b.xp - a.xp).slice(0, 30);
-  app.innerHTML = `
-    <div class="top">
-      <button onclick="go('home')">←</button>
-      <h2 style="margin:0">🏆 Таблица лидеров</h2>
-      <span></span>
-    </div>
-    <p class="muted">${modeTag()} Обновляется в реальном времени</p>
-    ${list.map((u, i) => `
-      <div class="lb ${u.id === me.id ? 'me' : ''}">
-        <span class="n">${['🥇', '🥈', '🥉'][i] || i + 1}</span>
-        <span class="nm"><b>${esc(u.name)}</b> <small class="muted">${esc(u.g || '')}</small></span>
-        <b>${u.xp} XP</b>
-      </div>`).join('')}`;
-}
-
-/* ---------- 6.6 О проекте ---------- */
-function aboutScreen() {
-  app.innerHTML = `
-    <div class="top">
-      <button onclick="go('home')">←</button>
-      <h2 style="margin:0">ℹ️ Описание разработки</h2>
-      <span></span>
-    </div>
-    <div class="card" style="line-height:1.5;font-size:15px">
-      <p><b>Цель.</b> Интерактивный тренажёр по тригонометрии, свойствам прямых, площадям и объёмам фигур. Доступ — по QR-коду, вход по нику и паролю.</p>
-      <p><b>Технологии.</b> HTML, CSS, JavaScript (без фреймворков), генерация QR (qrcodejs), общая база для рейтинга, SHA-256 для паролей.</p>
-      <p><b>Как устроено.</b> Вопросы генерируются случайно по шаблонам (3 уровня сложности, каждый генератор включается с определённого уровня), поэтому повторов почти нет. В раунде 10 вопросов, на каждый 25 секунд. XP = базовые очки × уровень + бонус за скорость + бонус за серию верных ответов; подсказка 50/50 стоит 5 XP.</p>
-      <p><b>Авторизация.</b> Ник + пароль: если ника нет — создаётся аккаунт, иначе проверяется хеш пароля. Данные игроков хранятся в общей базе, лидерборд обновляется у всех онлайн.</p>
-      <p><b>Дополнительно.</b> Ранги, награды, серии, подсказки, шпаргалка с формулами, тёмная/светлая тема, QR для приглашения.</p>
-    </div>`;
-}
-
-/* ---------- 6.7 Шпаргалка ---------- */
-function sheetScreen() {
-  app.innerHTML = `
-    <div class="top">
-      <button onclick="go('home')">←</button>
-      <h2 style="margin:0">📖 Шпаргалка</h2>
-      <span></span>
-    </div>
-    <details open>
-      <summary>Тригонометрия</summary>
-      <table>
-        <tr><th>α</th><th>30°</th><th>45°</th><th>60°</th></tr>
-        <tr><td>sin</td><td>1/2</td><td>√2/2</td><td>√3/2</td></tr>
-        <tr><td>cos</td><td>√3/2</td><td>√2/2</td><td>1/2</td></tr>
-        <tr><td>tg</td><td>√3/3</td><td>1</td><td>√3</td></tr>
-      </table>
-      <p class="muted">sin²α + cos²α = 1 · π рад = 180°</p>
-    </details>
-    <details>
-      <summary>Прямые</summary>
-      <p>y = kx + b · k = (y₂−y₁)/(x₂−x₁)<br>
-      Параллельны: k₁ = k₂ · Перпендикулярны: k₁·k₂ = −1<br>
-      Сумма углов треугольника 180° · односторонние углы: 180°</p>
-    </details>
-    <details>
-      <summary>Площади</summary>
-      <p>Прямоугольник ab · Треугольник ½ah · Трапеция ½(a+b)h<br>
-      Параллелограмм ah · Ромб ½d₁d₂ · Круг πr²</p>
-    </details>
-    <details>
-      <summary>Объёмы и поверхности</summary>
-      <p>Куб a³ · Параллелепипед abc · Призма Sh<br>
-      Цилиндр πr²h · Конус ⅓πr²h · Пирамида ⅓Sh · Шар 4/3·πr³<br>
-      Куб: 6a² · Цилиндр бок.: 2πrh</p>
-    </details>`;
-}
-
-/* ============================================================
-   7. QR
-   ============================================================ */
-function showQR() {
-  const url   = SHARE_URL || location.href;
-  const modal = document.createElement('div');
-  modal.className = 'modal';
-  modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
-  modal.innerHTML = `
-    <div class="card">
-      <h2>Вход по QR</h2>
-      <p class="muted">Наведи камеру телефона — откроется тренажёр</p>
-      <div id="qr"></div>
-      <p class="muted" style="word-break:break-all;font-size:12px">${esc(url)}</p>
-      <div class="row">
-        <button id="cp">📋 Копировать</button>
-        <button onclick="this.closest('.modal').remove()">Закрыть</button>
-      </div>
-    </div>`;
-  document.body.appendChild(modal);
-  try {
-    new QRCode($('#qr'), {
-      text: url, width: 210, height: 210, correctLevel: QRCode.CorrectLevel.M
-    });
-  } catch (e) {
-    $('#qr').textContent = 'QR недоступен — используй ссылку';
-  }
-  $('#cp').onclick = () => {
-    try {
-      navigator.clipboard.writeText(url);
-      $('#cp').textContent = '✅ Готово';
-    } catch (e) {}
-  };
-}
-
-/* ============================================================
-   8. INIT
-   ============================================================ */
-(async function init() {
-  const savedId = LS.get(SESSION_KEY, null);
-  me = savedId ? (LS.get(SCORES_KEY, {})[savedId] || null) : null;
-
-  if (me) { startBoard(); go('home'); }
-  else    { go('auth'); }
-
-  try {
-    if (window.claude && claude.use) {
-      db = await Promise.race([
-        claude.use('db'),
-        new Promise(resolve => setTimeout(() => resolve(null), 4000))
-      ]);
-      if (db) {
-        mode = 'shared';
-        if (savedId) {
-          const fresh = await getUser(savedId);
-          if (fresh) me = fresh;
-        }
-        if (me) startBoard();
-        if (screen === 'auth' || screen === 'home') go(screen);
-      }
-    }
-  } catch (e) {}
+const SHARE_URL='https://shmakodyavka-ashita.github.io/ProjectMath/';
+const $=s=>document.querySelector(s);
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const LS={get(k,d){try{const v=JSON.parse(localStorage.getItem(k));return v==null?d:v}catch(e){return d}},set(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}};
+const R=(a,b)=>Math.floor(Math.random()*(b-a+1))+a,pick=a=>a[R(0,a.length-1)];
+const shuffle=a=>a.map(x=>[Math.random(),x]).sort((p,q)=>p[0]-q[0]).map(x=>x[1]);
+const f2=n=>String(+n.toFixed(2)).replace('.',',').replace('-','−');
+const gcd=(a,b)=>b?gcd(b,a%b):a;
+const fr=(n,d)=>{const g=gcd(Math.abs(n),Math.abs(d))||1;n/=g;d/=g;if(d<0){n=-n;d=-d}return(d==1?String(n):n+'/'+d).replace('-','−')};
+const PI=3.14;
+let db=null,mode='local',me=null,board=[],unsub=null,screen='auth',G=null;
+
+/* ---------- хранилище ---------- */
+async function sha(s){try{const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode('mt|'+s));return[...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,'0')).join('')}catch(e){return btoa(unescape(encodeURIComponent('mt|'+s)))}}
+async function getU(id){if(db){try{const s=await db.collection('scores').doc(id).get();return s.exists?s.data():null}catch(e){db=null;mode='local'}}return LS.get('mt_scores',{})[id]||null}
+async function putU(u){const all=LS.get('mt_scores',{});all[u.id]=u;LS.set('mt_scores',all);if(db){try{await db.collection('scores').doc(u.id).set(u)}catch(e){db=null;mode='local'}}}
+function startBoard(){unsub&&unsub();const loc=()=>Object.values(LS.get('mt_scores',{}));if(db){try{unsub=db.collection('scores').onSnapshot(s=>{board=s.docs.map(d=>d.data());refresh()},()=>{board=loc();refresh()});return}catch(e){}}board=loc();refresh()}
+function refresh(){if(screen==='home'||screen==='board')go(screen)}
+
+/* ---------- генераторы вопросов ---------- */
+function mk(q,a,d,ex){const isN=typeof a==='number',fm=isN?f2:String,A=fm(a),s=new Set([A]),ds=[];
+ for(const x of d||[]){const v=fm(x);if(!s.has(v)){s.add(v);ds.push(v)}}
+ for(let i=0;isN&&ds.length<3&&i<80;i++){const x=a+pick([-1,1])*R(1,5)*Math.max(1,Math.round(Math.abs(a)/10));if(a>0&&x<=0)continue;const v=fm(x);if(!s.has(v)){s.add(v);ds.push(v)}}
+ return{q,a:A,o:shuffle([A,...ds.slice(0,3)]),ex}}
+const TV={sin:{30:'1/2',45:'√2/2',60:'√3/2'},cos:{30:'√3/2',45:'√2/2',60:'1/2'},tg:{30:'√3/3',45:'1',60:'√3'}};
+const POOL=['1/2','√2/2','√3/2','√3/3','1','√3'];
+const TR=[L=>{const an=pick([30,45,60]),fn=pick(['sin','cos','tg']),a=TV[fn][an];return mk(`Чему равен ${fn} ${an}°?`,a,shuffle(POOL.filter(x=>x!==a)).slice(0,3),`Табличное значение: ${fn} ${an}° = ${a}. Загляни в шпаргалку 😉`)},
+L=>{const[a,b,c]=pick([[3,4,5],[5,12,13],[8,15,17]]),k=L>1?R(2,4):1,fn=pick(['sin','cos','tg']),ans={sin:fr(a,c),cos:fr(b,c),tg:fr(a,b)}[fn];
+ return mk(`В прямоугольном треугольнике катеты ${a*k} и ${b*k}. Найди ${fn} угла α, лежащего напротив катета ${a*k}.`,ans,[fr(b,c),fr(a,b),fr(b,a),fr(c,a)].filter(x=>x!==ans).slice(0,3),`Гипотенуза = ${c*k}. sin = противолежащий/гипотенуза, cos = прилежащий/гипотенуза, tg = противолежащий/прилежащий. Ответ: ${ans}.`)},
+L=>{const p=pick([['π/6',30],['π/4',45],['π/3',60],['π/2',90],['2π/3',120],['3π/4',135],['5π/6',150],['π',180]]);return mk(`Переведи ${p[0]} радиан в градусы.`,p[1],[p[1]*2,p[1]+30,180-p[1]===p[1]?p[1]+15:180-p[1]],`π рад = 180°, поэтому ${p[0]} = ${p[1]}°.`)},
+L=>{const[a,b,c]=pick([[3,4,5],[5,12,13],[8,15,17]]),ans=fr(a,c);return mk(`cos α = ${fr(b,c)}, угол α острый. Найди sin α.`,ans,[fr(b,c),fr(a,b),fr(c,a)],`sin²α + cos²α = 1 → sin α = √(1 − (${b}/${c})²) = ${ans}.`)}];
+const lineEq=(k,b)=>'y = '+(k==1?'':k==-1?'−':k)+'x'+(b?(b>0?' + ':' − ')+Math.abs(b):'');
+const LN=[L=>{const x=R(40,80),t=pick([['соответственный',x],['накрест лежащий',x],['односторонний',180-x]]);return mk(`Две параллельные прямые пересечены секущей. Один из углов равен ${x}°. Чему равен ${t[0]} ему угол?`,t[1],[180-x,x+10,90-Math.min(x,89)+x===x?x+20:180-x+10],`Соответственные и накрест лежащие углы равны, односторонние дают в сумме 180°. Ответ: ${t[1]}°.`)},
+L=>{const k=pick([-3,-2,-1,1,2,3,4]),x1=R(-3,2),x2=x1+R(1,4),y1=R(-4,4),y2=y1+k*(x2-x1);return mk(`Найди угловой коэффициент прямой, проходящей через A(${f2(x1)}; ${f2(y1)}) и B(${f2(x2)}; ${f2(y2)}).`,k,[-k,k+1,k-1,k*2],`k = (y₂ − y₁)/(x₂ − x₁) = (${y2-y1})/(${x2-x1}) = ${k}.`)},
+L=>{if(Math.random()<.5){const k=pick([2,3,4,5,-2,-3]),b=R(-5,5);return mk(`Прямая ${lineEq(k,b)} перпендикулярна прямой y = mx + 1. Найди m.`,fr(-1,k),[fr(1,k),String(-k).replace('-','−'),String(k).replace('-','−')],`Для перпендикулярных прямых k₁·k₂ = −1, значит m = −1/${k} = ${fr(-1,k)}.`)}
+ const k=R(-5,5)||2;return mk(`Прямые y = ${f2(k)}x + 3 и y = mx − 5 параллельны. Найди m.`,k,[-k,k+1,k-1],`Параллельные прямые имеют равные угловые коэффициенты: m = ${f2(k)}.`)},
+L=>{const x=R(-4,4),y=R(-6,6);let k1=R(-3,3)||1,k2=R(-3,3)||-2;if(k1==k2)k2=k1+1;const b1=y-k1*x,b2=y-k2*x,p=(a,b)=>`(${f2(a)}; ${f2(b)})`;
+ return mk(`Найди точку пересечения прямых ${lineEq(k1,b1)} и ${lineEq(k2,b2)}.`,p(x,y),[p(y,x),p(-x,y),p(x,-y),p(x+1,y-1)].filter(v=>v!==p(x,y)).slice(0,3),`Приравняй правые части: ${k1}x + ${b1} = ${k2}x + ${b2} → x = ${x}, тогда y = ${y}.`)},
+L=>{const a=R(30,80),b=R(30,80);return mk(`В треугольнике два угла равны ${a}° и ${b}°. Найди третий угол.`,180-a-b,[360-a-b,90-a,180-a],`Сумма углов треугольника 180°: 180 − ${a} − ${b} = ${180-a-b}°.`)}];
+const GE=[L=>{const m=4+L*4,t=pick(['rect','tri','trap','par','rho','cir']);
+ if(t=='rect'){const a=R(3,m),b=R(2,m);return mk(`Площадь прямоугольника со сторонами ${a} и ${b}?`,a*b,[2*(a+b),a+b,a*b/2],`S = a·b = ${a}·${b} = ${a*b}.`)}
+ if(t=='tri'){const a=2*R(2,m),h=R(3,m);return mk(`Площадь треугольника с основанием ${a} и высотой ${h}?`,a*h/2,[a*h,a+h,a*h/3],`S = ½·a·h = ½·${a}·${h} = ${a*h/2}.`)}
+ if(t=='trap'){const a=R(3,m),b=a+2*R(1,3),h=R(2,m);return mk(`Основания трапеции ${a} и ${b}, высота ${h}. Найди площадь.`,(a+b)*h/2,[(a+b)*h,a*b*h/2,(a+b)/2],`S = ½(a + b)·h = ½·${a+b}·${h} = ${(a+b)*h/2}.`)}
+ if(t=='par'){const a=R(3,m),h=R(2,m);return mk(`Сторона параллелограмма ${a}, высота к ней ${h}. Найди площадь.`,a*h,[a*h/2,2*(a+h),a+h],`S = a·h = ${a*h}.`)}
+ if(t=='rho'){const d=2*R(2,m),e=R(3,m);return mk(`Диагонали ромба ${d} и ${e}. Найди площадь.`,d*e/2,[d*e,d+e,d*e/4],`S = ½·d₁·d₂ = ½·${d}·${e} = ${d*e/2}.`)}
+ const r=R(2,L*3+2);return mk(`Площадь круга радиуса ${r} (π ≈ 3,14)?`,PI*r*r,[2*PI*r,PI*r,PI*r*r*2],`S = πr² = 3,14·${r}² = ${f2(PI*r*r)}.`)},
+L=>{const m=2+L*2,t=pick(['cube','box','cyl','cone','pyr','sph','pri']);
+ if(t=='cube'){const a=R(2,m+1);return mk(`Объём куба с ребром ${a}?`,a**3,[a*a*6,a*a,3*a],`V = a³ = ${a}³ = ${a**3}.`)}
+ if(t=='box'){const a=R(2,m+2),b=R(2,m+2),c=R(2,m+2);return mk(`Объём параллелепипеда ${a}×${b}×${c}?`,a*b*c,[2*(a*b+b*c+a*c),a*b*c/2,a+b+c],`V = a·b·c = ${a*b*c}.`)}
+ if(t=='cyl'){const r=R(2,m),h=R(2,m+3);return mk(`Объём цилиндра: r = ${r}, h = ${h} (π ≈ 3,14).`,PI*r*r*h,[PI*r*r*h/3,2*PI*r*h,PI*r*r],`V = πr²h = 3,14·${r}²·${h} = ${f2(PI*r*r*h)}.`)}
+ if(t=='cone'){const r=R(2,m),h=3*R(1,m);return mk(`Объём конуса: r = ${r}, h = ${h} (π ≈ 3,14).`,PI*r*r*h/3,[PI*r*r*h,PI*r*h/3,PI*r*r*h*2/3],`V = ⅓πr²h = ⅓·3,14·${r}²·${h} = ${f2(PI*r*r*h/3)}.`)}
+ if(t=='pyr'){const s=R(4,m*4),h=3*R(1,m);return mk(`Площадь основания пирамиды ${s}, высота ${h}. Найди объём.`,s*h/3,[s*h,s*h/2,s+h],`V = ⅓·S·h = ⅓·${s}·${h} = ${s*h/3}.`)}
+ if(t=='sph'){const r=pick([3,6]);return mk(`Объём шара радиуса ${r} (π ≈ 3,14)?`,4/3*PI*r**3,[PI*r**3,4*PI*r*r,4/3*PI*r*r],`V = 4/3·πr³ = 4/3·3,14·${r}³ = ${f2(4/3*PI*r**3)}.`)}
+ const s=R(3,m*3),h=R(2,m+2);return mk(`Площадь основания призмы ${s}, высота ${h}. Найди объём.`,s*h,[s*h/3,s+h,s*h/2],`V = S·h = ${s*h}.`)},
+L=>{const m=3+L*2,t=pick(['cube','box','cyl']);
+ if(t=='cube'){const a=R(2,m+2);return mk(`Площадь поверхности куба с ребром ${a}?`,6*a*a,[4*a*a,a**3,12*a],`S = 6a² = 6·${a}² = ${6*a*a}.`)}
+ if(t=='box'){const a=R(2,m),b=R(2,m),c=R(2,m);const s=2*(a*b+b*c+a*c);return mk(`Площадь поверхности параллелепипеда ${a}×${b}×${c}?`,s,[a*b*c,s/2,a*b+b*c+a*c+a],`S = 2(ab + bc + ac) = ${s}.`)}
+ const r=R(2,m),h=R(2,m+2);return mk(`Площадь боковой поверхности цилиндра: r = ${r}, h = ${h} (π ≈ 3,14).`,2*PI*r*h,[PI*r*h,2*PI*r*(r+h),PI*r*r*h],`Sбок = 2πrh = 2·3,14·${r}·${h} = ${f2(2*PI*r*h)}.`)}];
+const TOP={trig:{n:'Тригонометрия',ic:'📐',g:TR,d:'sin, cos, tg, радианы'},lines:{n:'Свойства прямых',ic:'📏',g:LN,d:'углы, k, пересечения'},geo:{n:'Объёмы и площади',ic:'🧊',g:GE,d:'фигуры и тела'}};
+const genQ=(topic,L)=>{const t=topic==='mix'?pick(Object.keys(TOP)):topic;return{...pick(TOP[t].g)(L),t}};
+
+/* ---------- экраны ---------- */
+const app=$('#app');
+function go(s){screen=s;({auth,home,play,result,board:boardV,about,sheet}[s]||home)()}
+function themeBtn(){return`<button onclick="tg()" aria-label="Тема">🌓</button>`}
+function tg(){const d=document.documentElement,dark=getComputedStyle(d).colorScheme==='dark';d.dataset.theme=dark?'light':'dark'}
+const modeTag=()=>`<span class="badge">${mode==='shared'?'🌐 общий рейтинг':'📱 локальный рейтинг'}</span>`;
+
+function auth(){app.innerHTML=`<div class="card"><div class="big">🧮</div><h1 class="grad" style="text-align:center">МатТренажёр</h1><p class="muted" style="text-align:center">Тригонометрия · Прямые · Площади и объёмы</p>
+<input id="nm" placeholder="Ник или имя" maxlength="20" autocomplete="username"><input id="gr" placeholder="Группа (необязательно)" maxlength="12"><input id="pw" type="password" placeholder="Пароль" autocomplete="current-password">
+<p class="muted" id="msg">Нет аккаунта? Просто введи ник и придумай пароль — мы зарегистрируем тебя автоматически.</p>
+<button class="pri" onclick="doAuth()">Войти / Зарегистрироваться</button></div><p class="muted" style="text-align:center">${modeTag()}</p>`}
+async function doAuth(){const n=$('#nm').value.trim(),p=$('#pw').value,g=$('#gr').value.trim(),m=$('#msg');
+ if(n.length<2||p.length<3){m.textContent='Ник от 2 символов, пароль от 3.';return}
+ m.textContent='Проверяем…';const id='u'+(await sha(n.toLowerCase())).slice(0,20),ph=await sha(p+id);let u=await getU(id);
+ if(u){if(u.ph!==ph){m.textContent='❌ Неверный пароль для этого ника.';return}if(g&&g!==u.g){u.g=g;await putU(u)}}
+ else{u={id,name:n,g,ph,xp:0,best:0,games:0,solved:0,ok:0,streak:0,badges:[]};await putU(u)}
+ me=u;LS.set('mt_session',id);startBoard();go('home')}
+function logout(){LS.set('mt_session',null);me=null;unsub&&unsub();go('auth')}
+function rank(){const l=[...board.filter(x=>x.id!==me.id),me].sort((a,b)=>b.xp-a.xp);return l.findIndex(x=>x.id===me.id)+1}
+const lvlName=xp=>xp<100?'Новичок':xp<400?'Ученик':xp<1000?'Знаток':xp<2000?'Мастер':'Гуру математики';
+let selL=1;
+function home(){const acc=me.solved?Math.round(me.ok/me.solved*100):0;
+ app.innerHTML=`<div class="top"><div><div class="muted">Привет,</div><h2 style="margin:0">${esc(me.name)} 👋</h2></div><div class="row" style="flex:none"><button onclick="qr()">📱 QR</button>${themeBtn()}</div></div>
+<div class="card"><div class="stats"><div><b>${me.xp}</b><small>XP</small></div><div><b>#${rank()}</b><small>место</small></div><div><b>${me.games}</b><small>игр</small></div><div><b>${acc}%</b><small>точность</small></div></div>
+<p class="muted" style="margin:12px 0 0">Ранг: <b>${lvlName(me.xp)}</b> ${modeTag()}</p>${(me.badges||[]).map(b=>`<span class="badge">${esc(b)}</span>`).join('')}</div>
+<div class="card"><h2>Выбери тему</h2><div class="row" style="margin-bottom:10px">${[1,2,3].map(l=>`<button class="chip ${selL==l?'on':''}" onclick="selL=${l};home()">${['🟢 Лёгкий','🟡 Средний','🔴 Сложный'][l-1]}</button>`).join('')}</div>
+${Object.entries(TOP).map(([k,t])=>`<button class="topic" onclick="start('${k}')"><span class="ic">${t.ic}</span><span><b>${t.n}</b><small>${t.d}</small></span></button>`).join('')}
+<button class="topic" onclick="start('mix')"><span class="ic">🎲</span><span><b>Микс-челлендж</b><small>все темы вперемешку</small></span></button></div>
+<div class="row"><button onclick="go('board')">🏆 Лидеры</button><button onclick="go('sheet')">📖 Шпаргалка</button><button onclick="go('about')">ℹ️ О проекте</button><button onclick="logout()">🚪 Выйти</button></div>`}
+
+function start(t){G={t,L:selL,i:0,xp:0,streak:0,max:0,ok:0,hint:false,done:false};next()}
+function next(){if(G.i>=10){finish();return}G.q=genQ(G.t,G.L);G.i++;G.done=false;G.hint=false;G.left=25;go('play');clearInterval(G.tm);G.tm=setInterval(()=>{G.left-=.1;const b=$('#tb');if(b)b.style.width=Math.max(0,G.left/25*100)+'%';if(G.left<=0)ans(-1)},100)}
+function play(){const q=G.q;app.innerHTML=`<div class="top"><button onclick="quit()">✕</button><b>Вопрос ${G.i}/10</b><span class="badge">⭐ ${G.xp} · 🔥 ${G.streak}</span></div>
+<div class="card"><div class="bar"><i id="tb" style="width:${G.left/25*100}%"></i></div><div class="muted">${TOP[q.t].ic} ${TOP[q.t].n}</div><p class="q">${esc(q.q)}</p>
+<div class="opts">${q.o.map((o,i)=>`<button id="o${i}" onclick="ans(${i})">${esc(o)}</button>`).join('')}</div>
+<div id="fb"><button id="hb" style="margin-top:12px;width:100%" onclick="hint()">💡 Подсказка 50/50 (−5 XP)</button></div></div>`}
+function hint(){if(G.done||G.hint)return;G.hint=true;shuffle(G.q.o.map((o,i)=>i).filter(i=>G.q.o[i]!==G.q.a)).slice(0,2).forEach(i=>{const b=$('#o'+i);b.disabled=true;b.classList.add('off')});$('#hb').disabled=true}
+function ans(i){if(G.done)return;G.done=true;clearInterval(G.tm);const q=G.q,good=i>=0&&q.o[i]===q.a;
+ if(good){G.ok++;G.streak++;G.max=Math.max(G.max,G.streak);const g=10*G.L+Math.floor(Math.max(G.left,0)/5)+Math.min(G.streak,5)*2-(G.hint?5:0);G.xp+=Math.max(g,3)}else G.streak=0;
+ q.o.forEach((o,k)=>{const b=$('#o'+k);b.disabled=true;if(o===q.a)b.classList.add('ok');else if(k===i)b.classList.add('bad');else b.classList.add('off')});
+ $('#fb').innerHTML=`<div class="ex">${good?'✅ Верно!':i<0?'⏰ Время вышло.':'❌ Не совсем.'} ${esc(q.ex)}</div><button class="pri" style="margin-top:12px" onclick="next()">${G.i>=10?'Результаты':'Дальше →'}</button>`}
+function quit(){clearInterval(G.tm);go('home')}
+async function finish(){clearInterval(G.tm);const u=me;u.xp+=G.xp;u.best=Math.max(u.best||0,G.xp);u.games++;u.solved+=10;u.ok+=G.ok;u.t=Date.now();
+ const nb=[];const add=(c,t)=>{if(c&&!u.badges.includes(t)){u.badges.push(t);nb.push(t)}};
+ add(true,'🎓 Первая игра');add(G.ok==10,'💯 Идеальный раунд');add(G.max>=5,'🔥 Серия ×5');add(u.xp>=500,'🚀 500 XP');add(u.games>=10,'🏅 10 игр');add(G.L==3&&G.ok>=8,'🧠 Хардкор');
+ G.nb=nb;await putU(u);go('result')}
+function result(){const s=G.ok>=9?3:G.ok>=7?2:G.ok>=5?1:0;
+ app.innerHTML=`<div class="card"><div class="big">${'⭐'.repeat(s)||'💪'}</div><h1 style="text-align:center" class="grad">${G.ok} из 10</h1><p style="text-align:center" class="muted">+${G.xp} XP · лучшая серия 🔥 ${G.max}</p>
+<p style="text-align:center">Всего ${me.xp} XP · место <b>#${rank()}</b></p>${G.nb.length?`<p style="text-align:center">Новые награды:<br>${G.nb.map(b=>`<span class="badge">${b}</span>`).join('')}</p>`:''}
+<button class="pri" onclick="start('${G.t}')">Ещё раз</button><div class="row" style="margin-top:10px"><button onclick="go('board')">🏆 Лидеры</button><button onclick="go('home')">🏠 Меню</button></div></div>`}
+function boardV(){const l=[...board.filter(x=>x.id!==me.id),me].sort((a,b)=>b.xp-a.xp).slice(0,30);
+ app.innerHTML=`<div class="top"><button onclick="go('home')">←</button><h2 style="margin:0">🏆 Таблица лидеров</h2><span></span></div><p class="muted">${modeTag()} Обновляется в реальном времени</p>
+${l.map((u,i)=>`<div class="lb ${u.id===me.id?'me':''}"><span class="n">${['🥇','🥈','🥉'][i]||i+1}</span><span class="nm"><b>${esc(u.name)}</b> <small class="muted">${esc(u.g||'')}</small></span><b>${u.xp} XP</b></div>`).join('')}`}
+function about(){const U=SHARE_URL||location.href,L=(h,t)=>`<a href="${h}" target="_blank" rel="noopener" style="color:var(--a)">${t}</a>`;
+ app.innerHTML=`<div class="top"><button onclick="go('home')">←</button><h2 style="margin:0">ℹ️ О проекте</h2><span></span></div>
+<div class="card" style="line-height:1.55;font-size:15px"><h2>1. Где и как разрабатывали</h2>
+<p><b>Где.</b> Тренажёр разработан мной с помощью онлайн-сервисов: ИИ-ассистента (помощь с кодом), документации MDN, библиотеки QRCode.js и справочных материалов. Я ставил задачи, принимал решения по дизайну и функциям, проверял результат и находил ошибки. Готовый сайт — один HTML-файл, работает в любом браузере.</p>
+<p><b>Как.</b></p><ol style="padding-left:20px;margin:0 0 10px"><li>Разобрал задание и критерии: темы, вход по QR и паролю, описание.</li><li>Выбрал технологии: HTML, CSS, JavaScript без фреймворков; QR-код строится библиотекой QRCode.js; пароли хешируются SHA-256.</li><li>Спроектировал игру: 3 темы, 3 уровня, раунд из 10 вопросов, таймер 25 с, очки XP, серии, награды.</li><li>С помощью ИИ-ассистента реализовал генераторы задач (около 15 типов) со случайными числами и разбором решения после ответа.</li><li>Сделал регистрацию, общую таблицу лидеров и QR-вход.</li><li>Протестировал, нашёл и исправил ошибку запуска, опубликовал.</li></ol>
+<p><b>Формулы.</b> Значения sin, cos, tg для 30°, 45°, 60°, площади и объёмы фигур, уравнения прямых взяты из школьного курса геометрии и алгебры.</p>
+<p><b>Источники.</b></p><ul style="padding-left:20px;margin:0">
+<li>${L('https://github.com/davidshimjs/qrcodejs','QRCode.js — библиотека генерации QR-кодов (MIT)')}</li>
+<li>${L('https://developer.mozilla.org/ru/docs/Web/JavaScript','MDN: JavaScript')}</li>
+<li>${L('https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto/digest','MDN: SubtleCrypto.digest (SHA-256)')}</li>
+<li>${L('https://ru.wikipedia.org/wiki/QR-код','Википедия: QR-код')}</li>
+<li>${L('https://ru.wikipedia.org/wiki/Тригонометрические_функции','Википедия: тригонометрические функции')}</li>
+<li>Атанасян Л. С. и др. Геометрия. 7–9 и 10–11 классы (формулы площадей и объёмов).</li></ul></div>
+<div class="card" style="line-height:1.55;font-size:15px"><h2>2. Сайт тренажёра</h2>
+<p>Ссылка: <span style="word-break:break-all">${L(U,U)}</span></p>
+<p><b>Вход:</b> отсканируй QR-код или открой ссылку, введи ник и пароль (если ника нет, он создаётся автоматически). Затем выбери тему и сложность и пройди раунд из 10 вопросов. Очки попадают в общую таблицу лидеров.</p>
+<button class="pri" onclick="qr()">📱 Показать QR-код</button></div>`}
+function aboutOld(){app.innerHTML=`<div class="top"><button onclick="go('home')">←</button><h2 style="margin:0">ℹ️ Описание разработки</h2><span></span></div><div class="card" style="line-height:1.5;font-size:15px">
+<p><b>Цель.</b> Интерактивный тренажёр по тригонометрии, свойствам прямых, площадям и объёмам фигур. Доступ — по QR-коду, вход по нику и паролю.</p>
+<p><b>Технологии.</b> HTML, CSS, JavaScript (без фреймворков), генерация QR (qrcodejs), общая база для рейтинга, SHA-256 для паролей.</p>
+<p><b>Как устроено.</b> Вопросы генерируются случайно по шаблонам (≈15 типов задач, 3 уровня сложности), поэтому повторов почти нет. В раунде 10 вопросов, на каждый 25 секунд. XP = базовые очки × уровень + бонус за скорость + бонус за серию верных ответов; подсказка 50/50 стоит 5 XP.</p>
+<p><b>Авторизация.</b> Ник + пароль: если ника нет — создаётся аккаунт, иначе проверяется хеш пароля. Данные игроков хранятся в общей базе, лидерборд обновляется у всех онлайн.</p>
+<p><b>Дополнительно.</b> Ранги, награды, серии, подсказки, шпаргалка с формулами, тёмная/светлая тема, QR для приглашения.</p></div>`}
+function sheet(){app.innerHTML=`<div class="top"><button onclick="go('home')">←</button><h2 style="margin:0">📖 Шпаргалка</h2><span></span></div>
+<details open><summary>Тригонометрия</summary><table><tr><th>α</th><th>30°</th><th>45°</th><th>60°</th></tr><tr><td>sin</td><td>1/2</td><td>√2/2</td><td>√3/2</td></tr><tr><td>cos</td><td>√3/2</td><td>√2/2</td><td>1/2</td></tr><tr><td>tg</td><td>√3/3</td><td>1</td><td>√3</td></tr></table><p class="muted">sin²α + cos²α = 1 · π рад = 180°</p></details>
+<details><summary>Прямые</summary><p>y = kx + b · k = (y₂−y₁)/(x₂−x₁)<br>Параллельны: k₁ = k₂ · Перпендикулярны: k₁·k₂ = −1<br>Сумма углов треугольника 180° · односторонние углы: 180°</p></details>
+<details><summary>Площади</summary><p>Прямоугольник ab · Треугольник ½ah · Трапеция ½(a+b)h<br>Параллелограмм ah · Ромб ½d₁d₂ · Круг πr²</p></details>
+<details><summary>Объёмы и поверхности</summary><p>Куб a³ · Параллелепипед abc · Призма Sh<br>Цилиндр πr²h · Конус ⅓πr²h · Пирамида ⅓Sh · Шар 4/3·πr³<br>Куб: 6a² · Цилиндр бок.: 2πrh</p></details>`}
+
+/* ---------- QR ---------- */
+function qr(){const url=SHARE_URL||location.href;const m=document.createElement('div');m.className='modal';m.onclick=e=>{if(e.target===m)m.remove()};
+ m.innerHTML=`<div class="card"><h2>Вход по QR</h2><p class="muted">Наведи камеру телефона — откроется тренажёр</p><div id="qr"></div><p class="muted" style="word-break:break-all;font-size:12px">${esc(url)}</p><div class="row"><button id="cp">📋 Копировать</button><button onclick="this.closest('.modal').remove()">Закрыть</button></div></div>`;
+ document.body.appendChild(m);try{new QRCode($('#qr'),{text:url,width:210,height:210,correctLevel:QRCode.CorrectLevel.M})}catch(e){$('#qr').textContent='QR недоступен — используй ссылку'}
+ $('#cp').onclick=()=>{try{navigator.clipboard.writeText(url);$('#cp').textContent='✅ Готово'}catch(e){}}}
+
+/* ---------- запуск (в конце, когда всё объявлено) ---------- */
+(async()=>{
+ const s=LS.get('mt_session',null);
+ me=s?(LS.get('mt_scores',{})[s]||null):null;
+ if(me){startBoard();go('home')}else go('auth');
+ try{if(window.claude&&claude.use){
+  db=await Promise.race([claude.use('db'),new Promise(r=>setTimeout(()=>r(null),4000))]);
+  if(db){mode='shared';if(s){const u=await getU(s);if(u)me=u}if(me)startBoard();if(screen==='auth'||screen==='home')go(screen)}
+ }}catch(e){}
 })();
 </script>
 </body>
